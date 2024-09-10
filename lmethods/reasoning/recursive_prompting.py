@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from queue import Queue
+from threading import Lock
 from typing import Any
 
 import n2w
+from lcommon.utils.threading import GuardedValue, safe_exec_with_lock
 
 from lmethods.method import Method
 from lmethods.protocols import Logger, Model
@@ -180,7 +183,7 @@ class RecursivePrompting(Method):
 
         @property
         def instructions(self) -> list[tuple[str, str]]:
-            return self._shots["split"]
+            return self._shots["instructions"]
 
         @property
         def merge(self) -> list[tuple[str, str]]:
@@ -236,6 +239,7 @@ class RecursivePrompting(Method):
             self.instructions = instructions
             self.solution = solution
             self._split = False
+            self._lock = Lock()
 
         @property
         def uid(self) -> str:
@@ -362,6 +366,12 @@ class RecursivePrompting(Method):
 
             self._split = value
 
+        @property
+        def lock(self):
+            """The lock to be used to synchronize access to the problem."""
+
+            return self._lock
+
         def to_json(self) -> dict[str, Any]:
             """
             Converts the problem to a JSON-serializable dictionary.
@@ -395,7 +405,13 @@ class RecursivePrompting(Method):
     def shots_collection_cls(cls) -> type[ShotsCollection]:
         return cls.ShotsCollection
 
-    def __init__(self, model: Model, config: Config, logger: Logger | None = None):
+    def __init__(
+        self,
+        model: Model,
+        config: Config,
+        logger: Logger | None = None,
+        pool_executor: GuardedValue[ThreadPoolExecutor] | None = None,
+    ):
         """
         Initialize the recursive prompting method.
 
@@ -404,6 +420,7 @@ class RecursivePrompting(Method):
         `model`: the language model to be used, complying with the `Model` protocol specified in this library.
         `config`: the configuration of the method.
         [optional] `logger`: the logger to be used, complying with the `Logger` protocol specified in this library.
+        [optional] `pool_executor`: the thread pool executor to use; if not provided, a new one will be used for parallel computing.
         """
 
         super().__init__(model, config, logger)
@@ -411,9 +428,11 @@ class RecursivePrompting(Method):
             RecursivePrompting.Config
         )  # pyright is too dumb to understand this type
 
-        self._problems_cache: dict[str, RecursivePrompting._Problem] = {}
+        self._problems_cache: GuardedValue[dict[str, RecursivePrompting._Problem]] = (
+            GuardedValue(value={})
+        )
         self._id_gen = IDGenerator()
-        self._current_root_id: str | None = None
+        self._current_root_id: GuardedValue[str | None] = GuardedValue(value=None)
 
         self._unit_prompt = read_prompt(config.unit_prompt_path)
         self._split_prompt = read_prompt(config.split_prompt_path)
@@ -449,23 +468,31 @@ class RecursivePrompting(Method):
             DependencySyntax.BRACKETS_CURLY: ("{", "}"),
         }[self._config.dependency_syntax]
 
+        if pool_executor:
+            self._executor = pool_executor
+        else:
+            self._executor = GuardedValue(value=ThreadPoolExecutor())
+
     def _add_to_cache(self, problems: _Problem | list[_Problem]):
         if isinstance(problems, RecursivePrompting._Problem):
             problems = [problems]
 
         for problem in problems:
-            if problem.uid in self._problems_cache:
-                raise ValueError(
-                    f"[RecursivePrompting.generate] The problem with UID '{problem.uid}' is already in the cache."
-                )
-            self._problems_cache[problem.uid] = problem
+            with self._problems_cache.lock:
+                if problem.uid in self._problems_cache.value:
+                    raise ValueError(
+                        f"[RecursivePrompting.generate] The problem with UID '{problem.uid}' is already in the cache."
+                    )
+                self._problems_cache.value[problem.uid] = problem
 
     def _reset_state(self):
         self._logger.debug("[RecursivePrompting.reset_state] Resetting the state.")
-        self._problems_cache = {}
+        with self._problems_cache.lock:
+            self._problems_cache.value = {}
         self._id_gen.reset()
         self._local_usage = Usage()
-        self._current_root_id = None
+        with self._current_root_id.lock:
+            self._current_root_id.value = None
 
     def _generate_impl(
         self,
@@ -473,10 +500,10 @@ class RecursivePrompting(Method):
         shots: ShotsCollection = ShotsCollection(),
         max_tokens: int = 500,
     ) -> tuple[str, Method.GenerationInfo]:
-        self._current_root_id = self._id_gen.next()
-        problem = RecursivePrompting._Problem(
-            self._current_root_id, self._current_root_id, context
-        )
+        uid = self._id_gen.next()
+        with self._problems_cache.lock:
+            self._current_root_id.value = uid
+        problem = RecursivePrompting._Problem(uid, uid, context)
 
         self._logger.debug(
             {
@@ -487,9 +514,9 @@ class RecursivePrompting(Method):
                 "N. split shots": len(shots.split),
                 "N. instructions shots": len(shots.instructions),
                 "N. merge shots": len(shots.merge),
-                "Root ID": self._current_root_id,
+                "Root ID": self._current_root_id.value,
                 "Root obj.": problem,
-                "N. of nodes": len(self._problems_cache),
+                "N. of nodes": len(self._problems_cache.value),
                 "Local usage": self._local_usage,
                 "Global usage": self.usage,
             }
@@ -516,17 +543,19 @@ class RecursivePrompting(Method):
             )
 
         # Save the graph
-        self._save_graph(self._current_root_id)
+        with self._current_root_id.lock:
+            root_id = self._current_root_id.value
+        self._save_graph(root_id)
 
         self._logger.debug(
             {
                 "[RecursivePrompting.generate]": None,
-                "Root ID": self._current_root_id,
+                "Root ID": self._current_root_id.value,
                 "Root obj.": problem,
                 "Context": context,
                 "Max. tokens": max_tokens,
                 "Output": output,
-                "N. of nodes": len(self._problems_cache),
+                "N. of nodes": len(self._problems_cache.value),
                 "Usage stats": self._local_usage,
             }
         )
@@ -537,7 +566,6 @@ class RecursivePrompting(Method):
         self,
         problem: _Problem,
         shots: ShotsCollection = ShotsCollection(),
-        _visited: set[str] | None = None,
     ):
         """
         Solves a decomposition graph from the root using recursive prompting via the DFS strategy and stores the solutions in the problem objects.
@@ -549,44 +577,35 @@ class RecursivePrompting(Method):
         `problem`: the problem to be solved.
         `shots`: a shots collection to use for in-context learning.
         - If empty at any stage, the method will not use in-context learning (i.e., zero-shot).
-        (DO NOT USE) `_visited`: the set of IDs of the problems that have already been visited via DFS.
-        - Used internally to detect cycles in the graph; should not be set by the user.
         """
 
-        # Reset the default `_visited` value if problem is the root.
-        # This is necessary as default arguments are evaluated only once in Python,
-        # which is the trick we use here to share the visited nodes across recursive calls.
-        if _visited is None:
-            _visited = set()
-
-        if problem.uid in _visited:
-            self._logger.error(
-                {
-                    "[RecursivePrompting.generate:dfs] A cycle has been detected.": None,
-                    "Depth": problem.depth,
-                    "Problem UID": problem.uid,
-                    "Visited nodes": _visited,
-                }
-            )
-            if self._current_root_id:
-                self._save_graph(self._current_root_id)
-            raise RuntimeError(
-                f"[RecursivePrompting.generate:dfs] The dependencies of the sub-problems contain a cycle."
-            )
-        _visited.add(problem.uid)
+        if problem.is_solved:
+            return
 
         if not problem.is_split:
             self._logger.debug(f"Splitting problem {problem.uid} via DFS")
             self._split(problem, shots)
 
         # Solve each sub-problem recursively (if any)
-        # TODO: we can solve sub-problems in parallel here
-        for dep_id in [
-            id
-            for id in (problem.subproblems + problem.dependencies)
-            if not self._problems_cache[id].is_solved
-        ]:
-            self._solve_dfs(self._problems_cache[dep_id], shots, _visited)
+        with self._executor.lock and self._problems_cache.lock:
+            futures = [
+                self._executor.value.submit(
+                    safe_exec_with_lock,
+                    self._problems_cache.value[dep_id].lock,
+                    self._solve_dfs,
+                    self._problems_cache.value[dep_id],
+                    shots,
+                )
+                for dep_id in [
+                    id
+                    for id in (problem.subproblems + problem.dependencies)
+                    if not self._problems_cache.value[
+                        id
+                    ].is_solved  # BUG: Guard this read operation with problem lock?
+                ]
+            ]
+        for future in as_completed(futures):
+            future.result()
 
         # Obtain merging instructions
         if self._config.elicit_instructions:
@@ -605,16 +624,20 @@ class RecursivePrompting(Method):
                 "Sub-problems IDs": problem.subproblems,
                 "Dependencies IDs": problem.dependencies,
                 "Sub-problems desc.": [
-                    self._problems_cache[id].description for id in problem.subproblems
+                    self._problems_cache.value[id].description
+                    for id in problem.subproblems
                 ],
                 "Sub-problems sol.": [
-                    self._problems_cache[id].solution for id in problem.subproblems
+                    self._problems_cache.value[id].solution
+                    for id in problem.subproblems
                 ],
                 "Dependencies desc.": [
-                    self._problems_cache[id].description for id in problem.dependencies
+                    self._problems_cache.value[id].description
+                    for id in problem.dependencies
                 ],
                 "Dependencies sol.": [
-                    self._problems_cache[id].solution for id in problem.dependencies
+                    self._problems_cache.value[id].solution
+                    for id in problem.dependencies
                 ],
                 "Instructions": problem.instructions,
             }
@@ -626,7 +649,8 @@ class RecursivePrompting(Method):
         shots: ShotsCollection = ShotsCollection(),
     ):
         """
-        Solves a problem using recursive prompting via the BFS strategy and stores the solution in the problem object.
+        Solves a problem using recursive prompting via the BFS strategy and stores the solution in
+        the problem object.
 
         ### Parameters
         ----------
@@ -638,20 +662,28 @@ class RecursivePrompting(Method):
 
         ### Notes
         ----------
-        - The method will recursively solve the dependencies of the problem before splitting it. This means that this is not a
-        pure BFS traversal, but a BFS traversal with DFS-like behavior for dependencies. This is necessary to ensure that all information
-        required from the dependencies' solutions is obtained before attempting to split/solve a problem. This must also be done when
-        splitting because a problem may be split by creating partitions of its data, which may be generated by the dependencies.
+        - The method will recursively solve the dependencies of the problem before splitting it.
+        This means that this is not a pure BFS traversal, but a BFS traversal with DFS-like behavior
+        for dependencies. This is necessary to ensure that all information required from the
+        dependencies' solutions is obtained before attempting to split/solve a problem. This must also
+        be done when splitting because a problem may be split by creating partitions of its data, which
+        may be generated by the dependencies.
         """
 
-        # Even though we are using BFS, we still need to solve dependencies recursively before splitting (DFS-like behavior)
+        if problem.is_solved:
+            return
+
+        # Even though we are using BFS, we still need to solve dependencies recursively
+        # before splitting (DFS-like behavior)
         unsolved = Queue()
         for dep_id in problem.dependencies:
-            if not self._problems_cache[dep_id].is_solved:
+            with self._problems_cache.lock:
+                dep = self._problems_cache.value[dep_id]
+            if not dep.is_solved:
                 self._logger.debug(
                     f"Solving dependency with UID {dep_id} before splitting problem with UID {problem.uid} via BFS"
                 )
-                self._solve_bfs(self._problems_cache[dep_id], shots)
+                self._solve_bfs(dep, shots)
 
         self._logger.debug(
             f"Splitting root problem {problem.uid} via BFS with {len(problem.dependencies)} pre-existing dependencies"
@@ -662,24 +694,35 @@ class RecursivePrompting(Method):
             unsolved.put(dep_id)
 
         # Split (or solve directly if necessary) the sub-problems using BFS
-        # TODO: parallelize this
+        futures = []
         while not unsolved.empty():
-            p_id = unsolved.get()
-            p = self._problems_cache[p_id]
+            with self._problems_cache.lock:
+                p = self._problems_cache.value[unsolved.get()]
 
             if not p.is_split:
                 for dep_id in p.dependencies:
-                    if not self._problems_cache[dep_id].is_solved:
-                        self._logger.debug(
-                            f"Solving dependency with UID {dep_id} before splitting problem with UID {p_id} via BFS"
-                        )
-                        self._solve_bfs(self._problems_cache[dep_id], shots)
+                    with self._problems_cache.lock and self._executor.lock:
+                        if not self._problems_cache.value[dep_id].is_solved:
+                            futures.append(
+                                self._executor.value.submit(
+                                    safe_exec_with_lock,
+                                    self._problems_cache.value[dep_id].lock,
+                                    self._solve_bfs,
+                                    self._problems_cache.value[dep_id],
+                                    shots,
+                                )
+                            )
+
                 self._logger.debug(f"Splitting problem {p.uid} via BFS")
                 if not p.is_split:
                     self._split(p, shots)
+
                 for subp_id in p.subproblems:
-                    if not self._problems_cache[subp_id].is_solved:
+                    if not self._problems_cache.value[subp_id].is_solved:
                         unsolved.put(subp_id)
+
+        for future in as_completed(futures):
+            future.result()
 
         # Merge all problems in the graph reusing the DFS recursive logic
         self._solve_dfs(problem, shots)
@@ -693,16 +736,20 @@ class RecursivePrompting(Method):
                 "Sub-problems IDs": problem.subproblems,
                 "Dependencies IDs": problem.dependencies,
                 "Sub-problems desc.": [
-                    self._problems_cache[id].description for id in problem.subproblems
+                    self._problems_cache.value[id].description
+                    for id in problem.subproblems
                 ],
                 "Sub-problems sol.": [
-                    self._problems_cache[id].solution for id in problem.subproblems
+                    self._problems_cache.value[id].solution
+                    for id in problem.subproblems
                 ],
                 "Dependencies desc.": [
-                    self._problems_cache[id].description for id in problem.dependencies
+                    self._problems_cache.value[id].description
+                    for id in problem.dependencies
                 ],
                 "Dependencies sol.": [
-                    self._problems_cache[id].solution for id in problem.dependencies
+                    self._problems_cache.value[id].solution
+                    for id in problem.dependencies
                 ],
                 "Instructions": problem.instructions,
             }
@@ -756,22 +803,24 @@ class RecursivePrompting(Method):
                 break
             dep_uid = description[left_i + 1 : right_i].strip()
 
-            if dep_uid not in self._problems_cache:
-                self._logger.warn(
-                    f"[RecursivePrompting.generate:substitute_dependencies] The problem with UID '{dep_uid}' was"
-                    f"not found in the cache; it cannot be substituted in problem with UID {uid}."
-                )
-                anchor_i = right_i + 1
-                continue
-            elif not self._problems_cache[dep_uid].is_solved:
-                self._logger.warn(
-                    f"[RecursivePrompting.generate:substitute_dependencies] The dependency with UID '{dep_uid}' has"
-                    f"not been solved; it cannot be substituted in problem with UID {uid}."
-                )
-                anchor_i = right_i + 1
-                continue
+            with self._problems_cache.lock:
+                if dep_uid not in self._problems_cache.value:
+                    self._logger.warn(
+                        f"[RecursivePrompting.generate:substitute_dependencies] The problem with UID '{dep_uid}' was"
+                        f"not found in the cache; it cannot be substituted in problem with UID {uid}."
+                    )
+                    anchor_i = right_i + 1
+                    continue
+                elif not self._problems_cache.value[dep_uid].is_solved:
+                    self._logger.warn(
+                        f"[RecursivePrompting.generate:substitute_dependencies] The dependency with UID '{dep_uid}' has"
+                        f"not been solved; it cannot be substituted in problem with UID {uid}."
+                    )
+                    anchor_i = right_i + 1
+                    continue
 
-            dep_sol = self._problems_cache[dep_uid].solution or ""
+                dep_sol = self._problems_cache.value[dep_uid].solution or ""
+
             if dep_sol[-1] in END_CHARS:
                 dep_sol = dep_sol[:-1]
             description = description[:left_i] + dep_sol + description[right_i + 1 :]
@@ -781,6 +830,38 @@ class RecursivePrompting(Method):
             anchor_i = left_i + len(dep_sol) - len_diff
 
         return description
+
+    def _detect_cycles(self, problem: _Problem) -> bool:
+        """
+        Detect cycles in the problem dependencies using Depth-First Search (DFS).
+
+        ### Parameters
+        ----------
+        `problem`: the problem to check for cycles.
+
+        ### Returns
+        -------
+        `True` if a cycle is detected, `False` otherwise.
+        """
+
+        visited = set()
+        stack = set()
+
+        def visit(node_uid: str) -> bool:
+            if node_uid in stack:
+                return True
+            if node_uid in visited:
+                return False
+            visited.add(node_uid)
+            stack.add(node_uid)
+            with self._problems_cache.lock:
+                for dep_uid in self._problems_cache.value[node_uid].dependencies:
+                    if visit(dep_uid):
+                        return True
+            stack.remove(node_uid)
+            return False
+
+        return visit(problem.uid)
 
     def _split(
         self,
@@ -798,10 +879,9 @@ class RecursivePrompting(Method):
         """
 
         # If the max. depth or the max. num. of nodes are reached, solve the problem directly
-        if (
-            problem.depth >= self._config.max_depth
-            or len(self._problems_cache) >= self._config.max_nodes
-        ):
+        with self._problems_cache.lock:
+            n = len(self._problems_cache.value)
+        if problem.depth >= self._config.max_depth or n >= self._config.max_nodes:
             self._solve_directly(problem, shots)
             return
 
@@ -853,6 +933,23 @@ class RecursivePrompting(Method):
             subproblems_ids = self._parse_subproblems(split, problem.uid)
         problem.subproblems = subproblems_ids
         problem.is_split = True
+
+        # Check for cycles in the subproblems and their dependencies
+        if self._detect_cycles(problem):
+            self._logger.error(
+                {
+                    "[RecursivePrompting.generate:split] A cycle has been detected.": None,
+                    "Depth": problem.depth,
+                    "Problem UID": problem.uid,
+                }
+            )
+            with self._current_root_id.lock:
+                root_id = self._current_root_id.value
+            if root_id:
+                self._save_graph(root_id)
+            raise RuntimeError(
+                f"[RecursivePrompting.generate:split] The dependencies of the sub-problems contain a cycle."
+            )
 
     def _set_instructions(
         self, problem: _Problem, shots: list[tuple[str, str]] | None = None
@@ -938,12 +1035,13 @@ class RecursivePrompting(Method):
         `shots`: a list of (input, target) pairs to use for in-context learning.
         """
 
-        if problem.depth >= self._config.max_depth:
-            special_case = ":max_depth"
-        elif len(self._problems_cache) >= self._config.max_nodes:
-            special_case = ":max_budget"
-        else:
-            special_case = ""
+        with self._problems_cache.lock:
+            if problem.depth >= self._config.max_depth:
+                special_case = ":max_depth"
+            elif len(self._problems_cache.value) >= self._config.max_nodes:
+                special_case = ":max_budget"
+            else:
+                special_case = ""
 
         case, context = self._construct_unit_context(problem, shots)
 
@@ -983,7 +1081,7 @@ class RecursivePrompting(Method):
             {
                 f"[RecursivePrompting.generate:{case}{special_case}]": None,
                 "Depth": problem.depth,
-                "N. of nodes": len(self._problems_cache),
+                "N. of nodes": len(self._problems_cache.value),
                 "Model output": output[0][0],
                 "Problem UID": problem.uid,
                 "Problem desc.": problem.description,
@@ -1010,7 +1108,8 @@ class RecursivePrompting(Method):
         for i in range(self._config.n_context_ancestors):
             if p.parent is None:
                 break
-            p = self._problems_cache[p.parent]
+            with self._problems_cache.lock:
+                p = self._problems_cache.value[p.parent]
             ancestors_descriptions.put(p.description)
 
         context = ""
@@ -1050,13 +1149,17 @@ class RecursivePrompting(Method):
         # For the `BRAKETS_PARENS` syntax, dependencies are given to the model in bullet points too when merging
         # For other syntaxes, the solutions of dependencies are directly embedded in the context
         subproblems_plus_deps = problem.subproblems + problem.dependencies
+        with self._problems_cache.lock:
+            all_solved = all(
+                self._problems_cache.value[id].is_solved for id in subproblems_plus_deps
+            )
         if (
             (
                 self._config.dependency_syntax == DependencySyntax.BRACKETS_PARENS
                 and len(subproblems_plus_deps) > 0
             )
             or len(problem.subproblems) > 0
-        ) and all(self._problems_cache[id].is_solved for id in subproblems_plus_deps):
+        ) and all_solved:
             if self._config.dependency_syntax == DependencySyntax.BRACKETS_PARENS:
                 deps_str = self._construct_subproblems_str(subproblems_plus_deps)
             else:
@@ -1151,6 +1254,8 @@ class RecursivePrompting(Method):
                     break
 
         # Exceeding the maximum width
+        with self._problems_cache.lock:
+            n = len(self._problems_cache.value)
         if len(subproblems_dict) > self._config.max_width:
             log_msg = f"[RecursivePrompting.parse_subproblems] The number of sub-problems ({len(subproblems_dict)}) exceeds the max. width ({self._config.max_width})."
             if self._config.enforce_max_width:
@@ -1160,10 +1265,10 @@ class RecursivePrompting(Method):
             self._logger.warn(log_msg)
 
         # Exceeding the maximum number of nodes
-        elif len(subproblems_dict) + len(self._problems_cache) > self._config.max_nodes:
+        elif len(subproblems_dict) + n > self._config.max_nodes:
             self._logger.warn(
                 f"[RecursivePrompting.[parse_subproblems]] Adding the proposed sub-problems ({len(subproblems_dict)}) "
-                f"to the existing amount of problems ({len(self._problems_cache)}) would exceed the max. "
+                f"to the existing amount of problems ({n}) would exceed the max. "
                 f"num. of nodes ({self._config.max_nodes}). The problem will be solved directly."
             )
             return []
@@ -1311,12 +1416,14 @@ class RecursivePrompting(Method):
             desc = desc[1:]
         desc = desc.strip()
 
+        with self._problems_cache.lock:
+            parent_depth = self._problems_cache.value[parent_uid].depth
         return RecursivePrompting._Problem(
             uid=uid,
             lid=lid,
             description=desc,
             parent=parent_uid,
-            depth=self._problems_cache[parent_uid].depth + 1,
+            depth=parent_depth + 1,
             subproblems=[],
             dependencies=deps_ids,
         )
@@ -1325,17 +1432,20 @@ class RecursivePrompting(Method):
         if len(subproblems) == 0:
             return ""
 
-        return "".join(
-            [
-                f"- Sub-problem {dep.lid}: {dep.description}"
-                + (
-                    ""
-                    if not dep.is_solved
-                    else f" Sub-solution {dep.lid}: {dep.solution}\n"
-                )
-                for dep in [self._problems_cache[id] for id in subproblems]
-            ]
-        )[:-1]
+        with self._problems_cache.lock:
+            res = "".join(
+                [
+                    f"- Sub-problem {dep.lid}: {dep.description}"
+                    + (
+                        ""
+                        if not dep.is_solved
+                        else f" Sub-solution {dep.lid}: {dep.solution}\n"
+                    )
+                    for dep in [self._problems_cache.value[id] for id in subproblems]
+                ]
+            )[:-1]
+
+        return res
 
     def _save_graph(self, root_id: str) -> bool:
         """
@@ -1358,12 +1468,13 @@ class RecursivePrompting(Method):
             return False
 
         nodes = {}
-        for id, problem in self._problems_cache.items():
-            nodes[id] = {
-                "description": problem.description,
-                "dependencies": problem.subproblems + problem.dependencies,
-                "solution": problem.solution,
-            }
+        with self._problems_cache.lock:
+            for id, problem in self._problems_cache.value.items():
+                nodes[id] = {
+                    "description": problem.description,
+                    "dependencies": problem.subproblems + problem.dependencies,
+                    "solution": problem.solution,
+                }
 
         graph_dict = {"root_id": root_id, "nodes": nodes}
 
