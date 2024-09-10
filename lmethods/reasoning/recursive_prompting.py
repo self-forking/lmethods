@@ -33,7 +33,6 @@ from lmethods.utils import (
 
 # TODO: Provide prompts in a similar way as with the ShotsCollection
 # TODO: Parallelize `generate` (look at the WIP file)
-# TODO: Multi-process sub-problem solving
 class RecursivePrompting(Method):
     """A method that uses recursive prompting to solve multi-step reasoning problems."""
 
